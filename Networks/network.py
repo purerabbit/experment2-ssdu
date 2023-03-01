@@ -15,7 +15,7 @@ from data.utils import *
 
 class ParallelNetwork(nn.Module):
    
-    def __init__(self, num_layers, rank,slope,sample_slope):
+    def __init__(self, num_layers, rank,slope,sample_slope,sparsity):
         super(ParallelNetwork, self).__init__()
         self.num_layers = num_layers
         self.rank = rank
@@ -26,7 +26,8 @@ class ParallelNetwork(nn.Module):
         )
         # input_shape=[1,2,256,256]
         input_shape=[1,2,256,64]  #实现在采样到的部分进行学习
-        self.Memc_LOUPE_Model = Memc_LOUPE(input_shape, slope=slope, sample_slope=sample_slope, device=self.rank, sparsity=0.5)
+        print('net_sparsity:',sparsity)
+        self.Memc_LOUPE_Model = Memc_LOUPE(input_shape, slope=slope, sample_slope=sample_slope, device=self.rank, sparsity=sparsity)
     def get_submask(self,getmask):
         '''
         功能：得到采样到部分矩阵 以及对应坐标
@@ -47,13 +48,10 @@ class ParallelNetwork(nn.Module):
         # n=0
         recomask[b[0],0,b[1],b[2]]=list_mask_real
         recomask[b[0],1,b[1],b[2]]=list_mask_img
-        # for i,j ,k in zip(b[0],b[1],b[2]):
-        #     recomask[i,0,j,k]=list_mask_real[n]
-        #     recomask[i,1,j,k]=list_mask_img[n]
-        #     n=n+1
+
         return recomask
 
-    def forward(self,mask,gt,option):
+    def forward(self,mask,gt,option,mode):
         if option:
             onemask,b = self.get_submask(mask)
             sub_dc_mask = self.Memc_LOUPE_Model(onemask)  #B H select_W
@@ -62,7 +60,8 @@ class ParallelNetwork(nn.Module):
 
         else:
             loss_mask=dc_mask=mask
-        
+        if mode=='test':
+            loss_mask=dc_mask=mask
         k0_recon=fft2(gt)*dc_mask
         im_recon=ifft2(k0_recon)
         output_img=self.net(im_recon ,dc_mask,k0_recon)

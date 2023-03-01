@@ -15,3 +15,7 @@ LICENSE
 *.model_save
 *.json
 *.md
+/train_save/
+/test_save/
+/defe/
+/num_save/

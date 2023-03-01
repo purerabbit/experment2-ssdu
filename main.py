@@ -21,7 +21,8 @@ from torch.utils.tensorboard import SummaryWriter
 from Networks.network import ParallelNetwork as Network#导入网络
 # from IXI_dataset import IXIData as Dataset
 from mri_tools import rA, rAtA, rfft2
-from data.utils import *
+from data.utils import pseudo2real,complex2pseudo,pseudo2complex,image2kspace,kspace2image
+from metrics import compute_psnr,compute_ssim
 # from preprocessing import *
 from mask.gen_mask import *
 #导入fastmri数据集文件 导入方式可能有问题
@@ -44,9 +45,10 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0'#单GPU进行训练
 
 parser = argparse.ArgumentParser()
 #save images
-parser.add_argument('--strain', type=str, default=None, help='file_name_train')
-parser.add_argument('--vtrain', type=str, default=None, help='file_name_train')
-parser.add_argument('--stest', type=str, default=None, help='file_name_test')
+parser.add_argument('--strain', '-strain', type=str, default=None, help='file_name_train')
+parser.add_argument('--vtrain', '-vtrain', type=str, default=None, help='file_name_train')
+parser.add_argument('--stest', '-stest', type=str, default=None, help='file_name_test')
+parser.add_argument('--dc_ratio','-dc_ratio', type=float, default=0.5, help='file_name_test')
 
 parser.add_argument('--exp-name', type=str, default='self-supervised MRI reconstruction', help='name of experiment')
 # parameters related to distributed training
@@ -73,17 +75,17 @@ parser.add_argument('--train-path', type=str, default='/data/lc/3Dunet/fastmri_t
 parser.add_argument('--val-path', type=str, default='/data/lc/3Dunet/fastmri_val_3c.npz', help='path of validation data')
 parser.add_argument('--test-path', type=str, default='/data/lc/3Dunet/fastmri_test_3c.npz', help='path of test data')
 #改变了数据集路径
-parser.add_argument('--u-mask-path', type=str, default='./mask/undersampling_mask/mask_8.00x_acs24.mat', help='undersampling mask')
+parser.add_argument('--u-mask-path', type=str, default='/home/liuchun/Desktop/experment02/mask/undersampling_mask/vd_mask_under.mat', help='undersampling mask')
 #欠采样问题
-parser.add_argument('--s-mask-up-path', type=str, default='./mask/selecting_mask/mask_2.00x_acs16.mat', help='selection mask in up network')
-parser.add_argument('--s-mask-down-path', type=str, default='./mask/selecting_mask/mask_2.50x_acs16.mat', help='selection mask in down network')
+parser.add_argument('--s-mask-up-path', type=str, default='/home/liuchun/Desktop/experment02/mask/selecting_mask/vd_mask_up.mat', help='selection mask in up network')
+parser.add_argument('--s-mask-down-path', type=str, default='/home/liuchun/Desktop/experment02/mask/selecting_mask/vd_mask_down.mat', help='selection mask in down network')
 parser.add_argument('--train-sample-rate', '-trsr', type=float, default=0.06, help='sampling rate of training data')
 parser.add_argument('--val-sample-rate', '-vsr', type=float, default=0.02, help='sampling rate of validation data')
 parser.add_argument('--test-sample-rate', '-tesr', type=float, default=0.02, help='sampling rate of test data')
 # save path
 # parser.add_argument('--model-save-path', type=str, default='./checkpoints/', help='save path of trained model')
-parser.add_argument('--model-save-path','-mpath', type=str, default='./checkpoints', help='save path of trained model')
-parser.add_argument('--loss-curve-path','-lpath', type=str, default='./runs/loss_curve/', help='save path of loss curve in tensorboard')
+parser.add_argument('--model-save-path','-mpath', type=str, default='/home/liuchun/Desktop/experment02/model_save', help='save path of trained model')
+parser.add_argument('--loss-curve-path','-lpath', type=str, default='loss_log', help='save path of loss curve in tensorboard')
 # others
 parser.add_argument('--mode', '-m', type=str, default='train', help='whether training or test model, value should be set to train or test')
 parser.add_argument('--pretrained', '-pt', type=bool, default=False, help='whether load checkpoint')
@@ -174,38 +176,41 @@ def forward(mode, rank, model, dataloader, criterion, optimizer, log, args, epoc
         im_gt = data_batch[2].to(rank, non_blocking=True)
         und_mask=und_mask.unsqueeze(0).repeat(1,2,1,1)
         option= True
-        # if args.mode=='test':
-        #     loss_mask=dc_mask=und_mask
-        #     option=False
 
-        output,loss_mask,dc_mask = model(und_mask.contiguous(),im_gt,option)#output class 设成1
-
+        output,loss_mask,dc_mask = model(und_mask.contiguous(),im_gt,option,args.mode)#output class 设成1
+        print('args.mode',args.mode)
+        if args.mode=='test':
+            loss_mask=dc_mask=und_mask
+        #calculate loss
         gt_kspace = complex2pseudo(image2kspace(pseudo2complex(im_gt)))
-        loss_undersampled_image=complex2pseudo(kspace2image(pseudo2complex(gt_kspace*loss_mask)))
-        dc_undersampled_image=complex2pseudo(kspace2image(pseudo2complex(gt_kspace*dc_mask)))
         loss_undersampled_kspace=gt_kspace*loss_mask
         output_kspace=complex2pseudo(image2kspace(pseudo2complex(output)))
-
         batch_loss=cal_loss(loss_undersampled_kspace,output_kspace,loss_mask)
 
+        under_img=complex2pseudo(kspace2image(pseudo2complex(gt_kspace*und_mask)))
+
         if(args.strain!=None and mode=='train'):
-            img_show=torch.cat((pseudo2real(im_gt) ,loss_mask[:,0,:,:],loss_mask[:,1,:,:],pseudo2real(output),dc_mask[:,0,:,:],dc_mask[:,1,:,:]),0)
+            img_show=torch.cat((pseudo2real(im_gt) ,loss_mask[:,0,:,:],loss_mask[:,1,:,:],pseudo2real(output),dc_mask[:,0,:,:],dc_mask[:,1,:,:],pseudo2real(under_img)),0)
             gg=pseudo2real(im_gt)
             out=pseudo2real(output)
-            gg=(gg-torch.min(gg))/(torch.max(gg)-torch.min(gg))
-            out=(out-torch.min(out))/(torch.max(out)-torch.min(out))
+            under=pseudo2real(under_img)
+            # gg=(gg-torch.min(gg))/(torch.max(gg)-torch.min(gg))
+            # out=(out-torch.min(out))/(torch.max(out)-torch.min(out))
+            # under=(under-torch.min(under))/(torch.max(under)-torch.min(under))
             psnr_show=compute_psnr(gg,out)
             ssim_show=compute_ssim(gg,out)
-            filename2save=f'/home/liuchun/Desktop/gudingmask_ssdu/dual_domain/result_image/{args.strain}'
+            psnr_show_u=compute_psnr(gg,under)
+            ssim_show_u=compute_ssim(gg,under)
+            filename2save=f'/home/liuchun/Desktop/experment02/train_save/{args.strain}'
             if not os.path.exists(filename2save):
                 os.makedirs(filename2save)
-            imsshow(img_show.data.cpu().numpy(),['gt','loss_mask_real','loss_mask_imaginary','ssim: {:.3f} psnr: {:.3f}'.format(ssim_show, psnr_show),'dc_mask_real','dc_mask_imaginary'],3,cmap='gray',is_colorbar=True,filename2save=f'{filename2save}/{iter_num}.png')
+            imsshow(img_show.data.cpu().numpy(),['gt','loss_mask_real','loss_mask_imaginary','ssim: {:.3f} psnr: {:.3f}'.format(ssim_show, psnr_show),'dc_mask_real','dc_mask_imaginary','ussim: {:.3f} upsnr: {:.3f}'.format(ssim_show_u, psnr_show_u)],3,cmap='gray',is_colorbar=True,filename2save=f'{filename2save}/{iter_num}.png')
         if(args.vtrain!=None and mode=='val'):
             img_show=torch.cat((pseudo2real(im_gt) ,loss_mask[:,0,:,:],loss_mask[:,1,:,:],pseudo2real(output),dc_mask[:,0,:,:],dc_mask[:,1,:,:]),0)
             gg=pseudo2real(im_gt)
             out=pseudo2real(output)
-            gg=(gg-torch.min(gg))/(torch.max(gg)-torch.min(gg))
-            out=(out-torch.min(out))/(torch.max(out)-torch.min(out))
+            # gg=(gg-torch.min(gg))/(torch.max(gg)-torch.min(gg))
+            # out=(out-torch.min(out))/(torch.max(out)-torch.min(out))
             psnr_show=compute_psnr(gg,out)
             ssim_show=compute_ssim(gg,out)
             filename2save=f'/home/liuchun/Desktop/learn_mask_ssdu/save_train_02/{args.vtrain}'
@@ -213,18 +218,87 @@ def forward(mode, rank, model, dataloader, criterion, optimizer, log, args, epoc
                 os.makedirs(filename2save)
             imsshow(img_show.data.cpu().numpy(),['gt','loss_mask_real','loss_mask_imaginary','ssim: {:.3f} psnr: {:.3f}'.format(ssim_show, psnr_show),'dc_mask_real','dc_mask_imaginary'],3,cmap='gray',is_colorbar=True,filename2save=f'{filename2save}/{iter_num}.png')
 
+        # if(args.stest!=None and mode=='test'):
+        #     print('fsfdgdsgwgegrg')
+        #     img_show=torch.cat((pseudo2real(im_gt) ,loss_mask[:,0,:,:],loss_mask[:,1,:,:],pseudo2real(output),dc_mask[:,0,:,:],dc_mask[:,1,:,:],pseudo2real(under_img)),0)
+        #     gg=pseudo2real(im_gt)
+        #     out=pseudo2real(output)
+        #     under=pseudo2real(under_img)
+        #     print('min(gg):',gg.min())
+        #     print('max(gg):',gg.max())
+        #     print('min(out):',out.min())
+        #     print('max(out):',out.max())
+        #     print('min(under):',under.min())
+        #     print('max(under):',under.max())
+        #     filename2save=f'/home/liuchun/Desktop/experment02/test_save/{args.stest}'
+        #     if not os.path.exists(filename2save):
+        #         os.makedirs(filename2save)
+        #     np.save(f'/home/liuchun/Desktop/experment02/num_save/{iter_num}gt.npy',gg.data.cpu().numpy().squeeze())
+        #     np.save(f'/home/liuchun/Desktop/experment02/num_save/{iter_num}out.npy',out.data.cpu().numpy())
+        #     np.save(f'/home/liuchun/Desktop/experment02/num_save/{iter_num}under.npy',under.data.cpu().numpy())
+            # imsshow(gg.data.cpu().numpy(),[' '],1,cmap='gray',filename2save=f'{filename2save}/{iter_num}gt.png')
+            # imsshow(out.data.cpu().numpy(),[' '],1,cmap='gray',filename2save=f'{filename2save}/{iter_num}out.png')
+            # imsshow(under.data.cpu().numpy(),[' '],1,cmap='gray',filename2save=f'{filename2save}/{iter_num}under.png')
+        #看最大最小值的代码
+        # if(args.stest!=None and mode=='test'):   
+        #     gg=pseudo2real(im_gt)
+        #     out=pseudo2real(output)
+        #     under=pseudo2real(under_img)
+        #     #guiyihua
+        #     gg=(gg-gg.min())/(gg.max()-gg.min())
+        #     out=(out-out.min())/(out.max()-out.min())
+        #     under=(under-under.min())/(under.max()-under.min())
+        #     img_show=torch.cat((pseudo2real(im_gt) ,pseudo2real(im_gt) ,pseudo2real(output),pseudo2real(output),pseudo2real(under_img),pseudo2real(under_img)),0)
+        #     psnr_show=compute_psnr(gg,out)
+        #     ssim_show=compute_ssim(gg,out)
+        #     psnr_show_u=compute_psnr(gg,under)
+        #     ssim_show_u=compute_ssim(gg,under)
+        #     filename2save=f'/home/liuchun/Desktop/experment02/test_save/{args.stest}'
+        #     if not os.path.exists(filename2save):
+        #         os.makedirs(filename2save)
+
+        #     imsshow(img_show.data.cpu().numpy(),['gt{:.3f},{:.3f},{:.3f}'.format(gg.min(), gg.max(),torch.mean(gg)),\
+        #                                          'gt{:.3f},{:.3f},{:.3f}'.format(gg.min(), gg.max(),torch.mean(gg)),'loss_mask_imaginary',\
+        #                                             'out{:.3f},{:.3f},{:.3f}'.format(out.min(), out.max(),torch.mean(out)),\
+        #                                                 'ssim: {:.3f} psnr: {:.3f}'.format(ssim_show, psnr_show),\
+        #                                                     'under{:.3f},{:.3f},{:.3f}'.format(under.min(), under.max(),torch.mean(under)),\
+        #                                                         'ussim: {:.3f} upsnr: {:.3f}'.format(ssim_show_u, psnr_show_u)],\
+        #                                                         2,cmap='gray',is_colorbar=True,filename2save=f'{filename2save}/{iter_num}.png')
+
+
         if(args.stest!=None and mode=='test'):
-            img_show=torch.cat((pseudo2real(im_gt) ,loss_mask[:,0,:,:],loss_mask[:,1,:,:],pseudo2real(output),dc_mask[:,0,:,:],dc_mask[:,1,:,:]),0)
+            img_show=torch.cat((pseudo2real(im_gt) ,loss_mask[:,0,:,:],loss_mask[:,1,:,:],pseudo2real(output),dc_mask[:,0,:,:],dc_mask[:,1,:,:],pseudo2real(under_img)),0)
             gg=pseudo2real(im_gt)
             out=pseudo2real(output)
+            under=pseudo2real(under_img)
             gg=(gg-torch.min(gg))/(torch.max(gg)-torch.min(gg))
             out=(out-torch.min(out))/(torch.max(out)-torch.min(out))
+            under=(under-torch.min(under))/(torch.max(under)-torch.min(under))
             psnr_show=compute_psnr(gg,out)
             ssim_show=compute_ssim(gg,out)
-            filename2save=f'/home/liuchun/Desktop/learn_mask_ssdu/save_train_02/{args.stest}'
+            psnr_show_u=compute_psnr(gg,under)
+            ssim_show_u=compute_ssim(gg,under)
+            filename2save=f'/home/liuchun/Desktop/experment02/test_save/{args.stest}'
             if not os.path.exists(filename2save):
                 os.makedirs(filename2save)
-            imsshow(img_show.data.cpu().numpy(),['gt','loss_mask_real','loss_mask_imaginary','ssim: {:.3f} psnr: {:.3f}'.format(ssim_show, psnr_show),'dc_mask_real','dc_mask_imaginary'],3,cmap='gray',is_colorbar=True,filename2save=f'{filename2save}/{iter_num}.png')
+            imsshow(img_show.data.cpu().numpy(),['gt','loss_mask_real','loss_mask_imaginary',\
+                                                 'ssim: {:.3f} psnr: {:.3f}'.format(ssim_show, psnr_show),\
+                                                    'dc_mask_real','dc_mask_imaginary','ussim: {:.3f} upsnr: {:.3f}'.format(ssim_show_u, psnr_show_u)],\
+                                                        3,cmap='gray',is_colorbar=True,filename2save=f'{filename2save}/{iter_num}.png')
+
+        # if(args.stest!=None and mode=='test'):
+        #     img_show=torch.cat((pseudo2real(im_gt) ,loss_mask[:,0,:,:],loss_mask[:,1,:,:],pseudo2real(output),dc_mask[:,0,:,:],dc_mask[:,1,:,:]),0)
+        #     gg=pseudo2real(im_gt)
+        #     out=pseudo2real(output)
+        #     gg=(gg-torch.min(gg))/(torch.max(gg)-torch.min(gg))
+        #     out=(out-torch.min(out))/(torch.max(out)-torch.min(out))
+        #     psnr_show=compute_psnr(gg,out)
+        #     ssim_show=compute_ssim(gg,out)
+        #     # filename2save=f'/home/liuchun/Desktop/learn_mask_ssdu/save_train_02/{args.stest}'
+        #     filename2save=f'/home/liuchun/Desktop/experment02/test_save/{args.stest}'
+        #     if not os.path.exists(filename2save):
+        #         os.makedirs(filename2save)
+        #     imsshow(img_show.data.cpu().numpy(),['gt','loss_mask_real','loss_mask_imaginary','ssim: {:.3f} psnr: {:.3f}'.format(ssim_show, psnr_show),'dc_mask_real','dc_mask_imaginary'],3,cmap='gray',is_colorbar=True,filename2save=f'{filename2save}/{iter_num}.png')
 
         if mode == 'train':
             optimizer.zero_grad()
@@ -236,8 +310,8 @@ def forward(mode, rank, model, dataloader, criterion, optimizer, log, args, epoc
 
         gg=pseudo2real(im_gt)
         out=pseudo2real(output)
-        gg=(gg-torch.min(gg))/(torch.max(gg)-torch.min(gg))
-        out=(out-torch.min(out))/(torch.max(out)-torch.min(out))
+        # gg=(gg-torch.min(gg))/(torch.max(gg)-torch.min(gg))
+        # out=(out-torch.min(out))/(torch.max(out)-torch.min(out))
 
         #计算学到mask的数值比例
         rermask=rermask+(torch.sum(loss_mask[:,0,:,:])/torch.sum(und_mask[:,0,:,:]))
@@ -263,7 +337,7 @@ def forward(mode, rank, model, dataloader, criterion, optimizer, log, args, epoc
     loss /= len(dataloader)
     log.append(loss)
     testimg=  abs(torch.complex(output[0, 0], output[0, 1])).unsqueeze(0)
-    testimg = (testimg - torch.min(testimg))/(torch.max(testimg) - torch.min(testimg))
+    # testimg = (testimg - torch.min(testimg))/(torch.max(testimg) - torch.min(testimg))
     lmask0=loss_mask[0,0].unsqueeze(0)
     lmask1=loss_mask[0,1].unsqueeze(0)
     dmask0=dc_mask[0,0].unsqueeze(0)
@@ -319,17 +393,19 @@ def solvers(rank, ngpus_per_node, args):
  
     # model
     
-    model = Network(num_layers=args.num_layers, rank=rank,slope=args.slope,sample_slope=args.sample_slope)#默认值输入
+    model = Network(num_layers=args.num_layers, rank=rank,slope=args.slope,sample_slope=args.sample_slope,sparsity=args.dc_ratio)#默认值输入
     
     # print(model.keys())
     # whether load checkpoint  模型参数保存 改成共享参数可能会变化
     if args.pretrained or args.mode == 'test':
         #更改模型保存路径
-        modelsave=f'/home/liuchun/Desktop/gudingmask_ssdu/dual_domain/checkpoints/{args.model_save_path}'
-        if not os.path.exists(modelsave):
-            os.makedirs(modelsave)
-        model_path = os.path.join(modelsave, 'best_checkpoint.pth.tar')
-        # print('model_path:',model_path)
+        if(len(args.model_save_path.split('/'))>3):  #使用默认路径 3是根据前缀路径的长度确定
+            path_of_model= args.model_save_path
+        else:  #使用传入的参数路径
+            path_of_model='/home/liuchun/Desktop/experment02/model_save/'+args.model_save_path
+
+        model_path = os.path.join(path_of_model, 'best_checkpoint.pth.tar')
+        print('model_path:',model_path)
         assert os.path.isfile(model_path)
         checkpoint = torch.load(model_path, map_location='cuda:{}'.format(rank))
         start_epoch = checkpoint['epoch']
@@ -380,15 +456,15 @@ def solvers(rank, ngpus_per_node, args):
     # # print('dataset:',len(dataset))
     # train_loader,val_loader,test_loader=build_loader(dataset,args.batch_size)
 
-    dataset_train1 = FastmriKnee('/home/liuchun/Desktop/gudingmask_ssdu/dual_domain/data/PD_train_852(71).npz')
+    dataset_train1 = FastmriKnee('/home/liuchun/Desktop/experment02/data/PD_train_852(71).npz')
     dataset_train=DatasetReconMRI(dataset_train1)
     train_loader =build_loader(dataset_train,args.batch_size,is_shuffle=True)
 
-    dataset_val1 = FastmriKnee('/home/liuchun/Desktop/gudingmask_ssdu/dual_domain/data/PD_val_252(21).npz')
+    dataset_val1 = FastmriKnee('/home/liuchun/Desktop/experment02/data/PD_val_252(21).npz')
     dataset_val=DatasetReconMRI(dataset_val1)
     val_loader =build_loader(dataset_val,args.batch_size,is_shuffle=False)
 
-    dataset_test1 = FastmriKnee('/home/liuchun/Desktop/gudingmask_ssdu/dual_domain/data/PD_test_252(21).npz')
+    dataset_test1 = FastmriKnee('/home/liuchun/Desktop/experment02/data/PD_test_252(21).npz')
     dataset_test=DatasetReconMRI(dataset_test1)
     test_loader =build_loader(dataset_test,args.batch_size,is_shuffle=False)
 
@@ -421,12 +497,11 @@ def solvers(rank, ngpus_per_node, args):
 
     if rank == 0:
         # logger.info('The size of training dataset and validation dataset is {} and {}, respectively.'.format(len(train_set), len(val_set)))
-        logger.info('Now training {}.'.format(args.exp_name))
-        tbsave=f'/home/liuchun/Desktop/learn_mask_ssdu/save_tenb/{args.loss_curve_path}'
-        if not os.path.exists(tbsave):
-            os.makedirs(tbsave)
-        
-        writer = SummaryWriter(tbsave)
+        path_loss='/home/liuchun/Desktop/experment02/loss_save/'
+        path_loss=path_loss+args.loss_curve_path
+        if not os.path.exists(path_loss):
+            os.makedirs(path_loss)
+        writer = SummaryWriter(path_loss)
     for epoch in range(start_epoch + 1, args.num_epochs + 1):
         # train_sampler.set_epoch(epoch)
         train_log = [epoch]
@@ -485,12 +560,16 @@ def solvers(rank, ngpus_per_node, args):
                 'model': model.state_dict(keep_vars=True)
                 # 'model': model.module.state_dict()
             }
-            modelsave=f'/home/liuchun/Desktop/gudingmask_ssdu/dual_domain/checkpoints/{args.model_save_path}'
-            if not os.path.exists(modelsave):
-                os.makedirs(modelsave)
+            if(len(args.model_save_path.split('/'))>3):  #使用默认路径 3是根据前缀路径的长度确定
+                path_of_model= args.model_save_path
+            else:  #使用传入的参数路径
+                path_of_model='/home/liuchun/Desktop/experment02/model_save/'+args.model_save_path
 
-            model_path = os.path.join(modelsave, 'checkpoint.pth.tar')
-            best_model_path = os.path.join(modelsave, 'best_checkpoint.pth.tar')
+            if not os.path.exists(path_of_model):
+                os.makedirs(path_of_model)
+
+            model_path = os.path.join(path_of_model, 'checkpoint.pth.tar')
+            best_model_path = os.path.join(path_of_model, 'best_checkpoint.pth.tar')
             torch.save(checkpoint, model_path)
             print('modelpath:',model_path)
             print('save the checkpoints successfully!')
