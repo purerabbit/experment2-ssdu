@@ -23,8 +23,8 @@ class Memc_LOUPE(nn.Module):
 
     def calculate_Mask(self, kspace_mc, option):
         print('sparsity:',self.sparsity)
-        kspace_mc=kspace_mc.unsqueeze(1)
-        kspace_mc=kspace_mc.repeat(1,2,1,1)  #torch.Size([1, 2, 256, 64])
+        # kspace_mc=kspace_mc.unsqueeze(1)
+        # kspace_mc=kspace_mc.repeat(1,2,1,1)  #torch.Size([1, 2, 256, 64])
         logit_weights_real = 0 * kspace_mc[:,0, :, :] + self.add_weight_real
         logit_weights_imag = 0 * kspace_mc[:,1, :, :] + self.add_weight_imag
         prob_mask_tensor = torch.cat((logit_weights_real, logit_weights_imag), dim=1)
@@ -49,7 +49,7 @@ class Memc_LOUPE(nn.Module):
         return last_tensor_mask.to(device=self.device)
 
     def forward(self,mask):
-        B,H,W=mask.shape
-        assert H==256 and W!=256
+        B,C,H,W=mask.shape
+        assert H==256 and W==256
         dcmask = self.calculate_Mask(mask, option=True)#inital work
         return  dcmask

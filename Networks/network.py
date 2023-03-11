@@ -8,7 +8,9 @@ import torch.nn.functional as F
 from mri_tools import  ifft2,fft2
 from .cascade import CascadeMRIReconstructionFramework
 from .memc_loupe import Memc_LOUPE
+from .total_mask_loupe import TOTAL_LOUPE
 from data.utils import *
+import scipy.io as sio
 #从不同文件夹下导入包
 
 
@@ -24,10 +26,11 @@ class ParallelNetwork(nn.Module):
         self.net = CascadeMRIReconstructionFramework(
             n_cascade=5  #the formor is 5
         )
-        # input_shape=[1,2,256,256]
-        input_shape=[1,2,256,64]  #实现在采样到的部分进行学习
+        input_shape_two=[1,2,256,256]
+        input_shape_one=[1,2,256,64]  #实现在采样到的部分进行学习
         print('net_sparsity:',sparsity)
-        self.Memc_LOUPE_Model = Memc_LOUPE(input_shape, slope=slope, sample_slope=sample_slope, device=self.rank, sparsity=sparsity)
+        self.Memc_LOUPE_Model = Memc_LOUPE(input_shape_one, slope=slope, sample_slope=sample_slope, device=self.rank, sparsity=sparsity)
+        self.TOTAL_LOUPE_Model = TOTAL_LOUPE(input_shape_two, slope, sample_slope, device=self.rank, sparsity_under=0.25,sparsity_select=0.15) #dc learn 0.6
     def get_submask(self,getmask):
         '''
         功能：得到采样到部分矩阵 以及对应坐标
@@ -51,35 +54,31 @@ class ParallelNetwork(nn.Module):
 
         return recomask
 
-    def forward(self,mask,gt,option,mode):
-        if option:
-            onemask,b = self.get_submask(mask)
-            sub_dc_mask = self.Memc_LOUPE_Model(onemask)  #B H select_W
-            dc_mask = self.recovery_mask(mask,sub_dc_mask,b)
-            loss_mask=mask-dc_mask
+    def forward(self,mask,gt,option,mode,gdc_mask,gloss_mask):
+        
+        if mode=='train':
+            if option=='onemask':
+                # print('onemask')
+                onemask,b = self.get_submask(mask)
+                sub_dc_mask = self.Memc_LOUPE_Model(onemask)  #B H select_W
+                dc_mask = self.recovery_mask(mask,sub_dc_mask,b)
+                loss_mask=mask-dc_mask
+            elif option=="twomask":
+                # print('twomask')
+                kspace=fft2(gt)
+                mask,dc_mask,loss_mask=self.TOTAL_LOUPE_Model(kspace)
+            elif option=="baseline":
+                # print('baseline')
+                dc_mask=gdc_mask
+                loss_mask=gloss_mask
 
         else:
             loss_mask=dc_mask=mask
-        if mode=='test':
-            loss_mask=dc_mask=mask
+        
         k0_recon=fft2(gt)*dc_mask
         im_recon=ifft2(k0_recon)
         output_img=self.net(im_recon ,dc_mask,k0_recon)
         return  output_img,loss_mask,dc_mask
-
-# img_show=torch.cat((pseudo2real(im_gt) ,pseudo2real(loss_undersampled_image),pseudo2real(dc_undersampled_image),pseudo2real(output),pseudo2real(loss_mask),pseudo2real(dc_mask)),0)
-# gg=pseudo2real(im_gt)
-# out=pseudo2real(output)
-# gg=(gg-torch.min(gg))/(torch.max(gg)-torch.min(gg))
-# out=(out-torch.min(out))/(torch.max(out)-torch.min(out))
-# psnr_show=compute_psnr(gg,out)
-# ssim_show=compute_ssim(gg,out)
-# filename2save=f'/home/liuchun/Desktop/learn_mask_ssdu/save_train_02/{args.strain}'
-# if not os.path.exists(filename2save):
-#     os.makedirs(filename2save)
-# imsshow(img_show.data.cpu().numpy(),['gt','loss_undersampled','dc_undersampled','ssim: {:.3f} psnr: {:.3f}'.format(ssim_show, psnr_show),'loss_mask','dc_mask'],3,cmap='gray',is_colorbar=True,filename2save=f'{filename2save}/{iter_num}.png')
-
-
 
 
 

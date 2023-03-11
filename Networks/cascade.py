@@ -43,16 +43,31 @@ class CascadeMRIReconstructionFramework(nn.Module):
         dc_layers = [DataConsistencyLayer() for _ in range(n_cascade)]
         self.dc_layers = nn.ModuleList(dc_layers)
 
-    def forward(self,im_recon, mask,k0):
+    def forward(self,im_init, mask,k0):
+        im_recon=im_init
         B, C, H, W = im_recon.shape
         B, C, H, W = k0.shape
         assert C == 2
         assert (B,C, H, W) == tuple(mask.shape)
-   
+
         for dc_layer in self.dc_layers:
-            im_recon=self.cnn(im_recon)    
+            im_recon = self.cnn(im_recon)
+            im_recon = pseudo2real(im_init)+im_recon
             im_recon = dc_layer(im_recon, mask, k0)
         return im_recon
+
+
+    # def forward(self,im_recon, mask,k0):
+    #     B, C, H, W = im_recon.shape
+    #     B, C, H, W = k0.shape
+    #     assert C == 2
+    #     assert (B,C, H, W) == tuple(mask.shape)
+   
+    #     for dc_layer in self.dc_layers:
+    #         im_recon=self.cnn(im_recon)
+                
+    #         im_recon = dc_layer(im_recon, mask, k0)
+    #     return im_recon
 
 
 
